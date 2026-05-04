@@ -472,22 +472,20 @@ public class DataStreamMongoDBToFirestore {
                   builder -> builder.serverSelectionTimeout(10, TimeUnit.MINUTES))
               .uuidRepresentation(UuidRepresentation.STANDARD)
               .build();
-      MongoClient mongoClient = MongoClients.create(settings);
-      LOG.info("MongoDB client created successfully");
+      // Use try-with-resources to ensure the client is closed even if pipeline submission fails.
+      try (MongoClient mongoClient = MongoClients.create(settings)) {
+        LOG.info("MongoDB client created successfully");
 
-      // Choose processing mode based on options
-      LOG.info("Starting pipeline execution");
-      PipelineResult result;
-      if (options.getProcessBackfillFirst()) {
-        LOG.info("Using backfill-first processing mode");
-        runWithBackfillFirst(options, connectionString);
-      } else {
-        LOG.info("Using unified processing mode");
-        runAllEventsTogether(options, connectionString);
+        // Choose processing mode based on options
+        LOG.info("Starting pipeline execution");
+        if (options.getProcessBackfillFirst()) {
+          LOG.info("Using backfill-first processing mode");
+          runWithBackfillFirst(options, connectionString);
+        } else {
+          LOG.info("Using unified processing mode");
+          runAllEventsTogether(options, connectionString);
+        }
       }
-
-      mongoClient.close();
-      LOG.info("MongoDB client closed");
     } catch (Exception e) {
       LOG.error("Failed to run pipeline: {}", e.getMessage(), e);
       throw e;
@@ -525,29 +523,7 @@ public class DataStreamMongoDBToFirestore {
         ingestAndNormalizeJson(options, dlqManager, pipeline)
             .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
 
-    // Optional Stage 1.5: Apply Javascript UDF for JSON transformation
-    if (!Strings.isNullOrEmpty(options.getJavascriptTextTransformGcsPath())) {
-      LOG.info("Applying Javascript UDF for JSON transformation");
-      PCollectionTuple udfResult =
-          jsonRecords.apply(
-              "Run UDF",
-              FailsafeJavascriptUdf.<String>newBuilder()
-                  .setFileSystemPath(options.getJavascriptTextTransformGcsPath())
-                  .setFunctionName(options.getJavascriptTextTransformFunctionName())
-                  .setReloadIntervalMinutes(
-                      options.getJavascriptTextTransformReloadIntervalMinutes())
-                  .setSuccessTag(UDF_SUCCESS_TAG)
-                  .setFailureTag(UDF_FAILURE_TAG)
-                  .build());
 
-      jsonRecords =
-          udfResult
-              .get(UDF_SUCCESS_TAG)
-              .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
-
-      // Handle failed UDF processing
-      writeFailedJsonToDlq(options, udfResult, dlqManager, UDF_FAILURE_TAG);
-    }
 
     // Stage 2: Create MongoDbChangeEventContext objects
     LOG.info("Creating MongoDbChangeEventContext objects");
@@ -574,11 +550,124 @@ public class DataStreamMongoDBToFirestore {
         dlqManager,
         CreateMongoDbChangeEventContextFn.failedCreationTag);
 
+    // We start with the collection of successfully created MongoDbChangeEventContext elements.
+    PCollection<MongoDbChangeEventContext> contextsToProcess =
+        changeEventContexts.get(CreateMongoDbChangeEventContextFn.successfulCreationTag);
+
+    // UDF is applied after MongoDbChangeEventContext creation
+    // so that it can operate on the extracted document JSON string available in the context,
+    // rather than on the raw input string which might not be fully parsed or normalized yet.
+    // Optional Stage 2.5: Apply Javascript UDF for Document transformation
+    if (!Strings.isNullOrEmpty(options.getJavascriptTextTransformGcsPath())) {
+      LOG.info("Applying Javascript UDF for Document transformation");
+      
+      // Split the stream into deletes and non-deletes before UDF.
+      // Delete events produce null docJson and would be dropped by ExtractUdfInputFn if not handled.
+      // We bypass UDF for deletes to avoid sending empty payloads to UDF.
+      PCollectionTuple udfPreparation =
+          contextsToProcess.apply(
+                  "Prepare UDF Input",
+                  ParDo.of(new ExtractUdfInputFn())
+                      .withOutputTags(
+                          ExtractUdfInputFn.UDF_INPUT_TAG,
+                          TupleTagList.of(ExtractUdfInputFn.DELETES_TAG)));
+      
+      PCollection<FailsafeElement<MongoDbChangeEventContext, String>> udfInput = udfPreparation.get(ExtractUdfInputFn.UDF_INPUT_TAG);
+      PCollection<MongoDbChangeEventContext> deletes = udfPreparation.get(ExtractUdfInputFn.DELETES_TAG);
+
+      TupleTag<FailsafeElement<MongoDbChangeEventContext, String>> udfSuccessTag = new TupleTag<FailsafeElement<MongoDbChangeEventContext, String>>() {};
+      TupleTag<FailsafeElement<MongoDbChangeEventContext, String>> udfFailureTag = new TupleTag<FailsafeElement<MongoDbChangeEventContext, String>>() {};
+
+      PCollectionTuple udfResult =
+          udfInput.apply(
+              "Run UDF on Document",
+              FailsafeJavascriptUdf.<MongoDbChangeEventContext>newBuilder()
+                  .setFileSystemPath(options.getJavascriptTextTransformGcsPath())
+                  .setFunctionName(options.getJavascriptTextTransformFunctionName())
+                  .setReloadIntervalMinutes(
+                      options.getJavascriptTextTransformReloadIntervalMinutes())
+                  .setSuccessTag(udfSuccessTag)
+                  .setFailureTag(udfFailureTag)
+                  .build());
+
+      // After successful UDF execution, we update the MongoDbChangeEventContext
+      // with the modified JSON string data. This ensures that subsequent steps
+      // use the transformed data instead of the original data.
+      // Update MongoDbChangeEventContext with UDF result
+      PCollection<MongoDbChangeEventContext> successfulUdfNonDeletes =
+          udfResult
+              .get(udfSuccessTag)
+              .apply(
+                  "Update Context with UDF Result",
+                  ParDo.of(
+                      new DoFn<FailsafeElement<MongoDbChangeEventContext, String>, MongoDbChangeEventContext>() {
+                        @ProcessElement
+                        public void processElement(ProcessContext c) {
+                          FailsafeElement<MongoDbChangeEventContext, String> element = c.element();
+                          MongoDbChangeEventContext context = element.getOriginalPayload();
+                           // Store the modified data back in the context.
+                           try {
+                             org.bson.Document fullEvent = org.bson.Document.parse(context.getDataAsJsonString());
+                             fullEvent.put(com.google.cloud.teleport.v2.templates.datastream.MongoDbChangeEventContext.DATA_COL, org.bson.Document.parse(element.getPayload()));
+                             context.setModifiedJsonStringData(fullEvent.toJson());
+                           } catch (Exception e) {
+                             LOG.error("Failed to merge UDF result back into event: {}", e.getMessage());
+                             context.setModifiedJsonStringData(element.getPayload());
+                           }
+                          c.output(context);
+                        }
+                      }));
+
+      // Flatten the bypassed deletes and the successful UDF results back together.
+      // This ensures deletes are not lost when UDF is enabled.
+      contextsToProcess = PCollectionList.of(deletes).and(successfulUdfNonDeletes)
+          .apply("Merge Deletes and UDF Results", Flatten.pCollections());
+
+      // Any failures during UDF execution are captured and routed to the Dead Letter Queue (DLQ)
+      // for manual inspection or reprocessing.
+      // DLQ UDF failures
+      PCollection<FailsafeElement<String, String>> mappedFailures =
+          udfResult
+              .get(udfFailureTag)
+              .apply(
+                  "Map UDF Failures to String",
+                  ParDo.of(
+                      new DoFn<FailsafeElement<MongoDbChangeEventContext, String>, FailsafeElement<String, String>>() {
+                        @ProcessElement
+                        public void processElement(ProcessContext c) {
+                          FailsafeElement<MongoDbChangeEventContext, String> element = c.element();
+                          MongoDbChangeEventContext context = element.getOriginalPayload();
+                          FailsafeElement<String, String> mapped =
+                              FailsafeElement.of(
+                                  context.getDataAsJsonString(),
+                                  element.getPayload());
+                          mapped.setErrorMessage(element.getErrorMessage());
+                          mapped.setStacktrace(element.getStacktrace());
+                          c.output(mapped);
+                        }
+                      }));
+
+      mappedFailures
+          .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()))
+          .apply(
+              "DLQ: Write UDF Failures to GCS",
+              MapElements.via(new StringDeadLetterQueueSanitizer()))
+          .setCoder(StringUtf8Coder.of())
+          .apply(
+              "Write UDF Failed Json To DLQ",
+              DLQWriteTransform.WriteDLQ.newBuilder()
+                  .withDlqDirectory(dlqManager.getSevereDlqDirectoryWithDateTime())
+                  .withTmpDirectory(options.getDeadLetterQueueDirectory() + "/tmp_udf_failed/")
+                  .setIncludePaneInfo(true)
+                  .build());
+    }
+
+    // If the UDF GCS path was not provided, contextsToProcess remains unchanged
+    // and points to the original collection with unmodified data.
     // Stage 3: Split events into backfill and CDC streams
     LOG.info("Splitting events into backfill and CDC streams");
     PCollectionTuple splitEvents =
-        changeEventContexts
-            .get(CreateMongoDbChangeEventContextFn.successfulCreationTag)
+        contextsToProcess
             .apply(
                 "Split Backfill and CDC",
                 ParDo.of(new SplitBackfillAndCdcEventsFn())
@@ -746,30 +835,7 @@ public class DataStreamMongoDBToFirestore {
         ingestAndNormalizeJson(options, dlqManager, pipeline)
             .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
 
-    /*
-     * Optional Stage 1.5: Apply Javascript UDF to transform JSON strings
-     */
-    if (!Strings.isNullOrEmpty(options.getJavascriptTextTransformGcsPath())) {
-      PCollectionTuple udfResult =
-          jsonRecords.apply(
-              "Run UDF",
-              FailsafeJavascriptUdf.<String>newBuilder()
-                  .setFileSystemPath(options.getJavascriptTextTransformGcsPath())
-                  .setFunctionName(options.getJavascriptTextTransformFunctionName())
-                  .setReloadIntervalMinutes(
-                      options.getJavascriptTextTransformReloadIntervalMinutes())
-                  .setSuccessTag(UDF_SUCCESS_TAG)
-                  .setFailureTag(UDF_FAILURE_TAG)
-                  .build());
 
-      jsonRecords =
-          udfResult
-              .get(UDF_SUCCESS_TAG)
-              .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
-
-      // Handle failed UDF processing
-      writeFailedJsonToDlq(options, udfResult, dlqManager, UDF_FAILURE_TAG);
-    }
 
     LOG.info("Stage 1: Completed ingestion of data from GCS");
 
@@ -1067,6 +1133,33 @@ public class DataStreamMongoDBToFirestore {
     LOG.info("Severe DLQ setup completed");
   }
 
+  /** DoFn to extract document data for UDF input. */
+  public static class ExtractUdfInputFn
+      extends DoFn<MongoDbChangeEventContext, FailsafeElement<MongoDbChangeEventContext, String>> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ExtractUdfInputFn.class);
+    
+    // Tags for splitting output: UDF input and bypass (deletes)
+    public static final TupleTag<FailsafeElement<MongoDbChangeEventContext, String>> UDF_INPUT_TAG = new TupleTag<FailsafeElement<MongoDbChangeEventContext, String>>("udfInput") {};
+    public static final TupleTag<MongoDbChangeEventContext> DELETES_TAG = new TupleTag<MongoDbChangeEventContext>("deletes") {};
+
+    @ProcessElement
+    public void processElement(ProcessContext c, MultiOutputReceiver out) {
+      MongoDbChangeEventContext context = c.element();
+      try {
+        String docJson = context.getDocumentDataAsJsonString();
+        if (docJson != null) {
+          out.get(UDF_INPUT_TAG).output(FailsafeElement.of(context, docJson));
+        } else {
+          // Delete events have null docJson. We route them to side output to bypass UDF.
+          out.get(DELETES_TAG).output(context);
+        }
+      } catch (Exception e) {
+        LOG.error("Failed to extract document for UDF: {}", e.getMessage());
+      }
+    }
+  }
+
   /** DoFn to split events into backfill and CDC streams. */
   public static class SplitBackfillAndCdcEventsFn
       extends DoFn<MongoDbChangeEventContext, MongoDbChangeEventContext> {
@@ -1231,50 +1324,69 @@ public class DataStreamMongoDBToFirestore {
         return;
       }
 
+      // Create bulk operation
+      List<WriteModel<Document>> bulkOperations = new ArrayList<>(events.size());
+      List<Integer> bulkOpToEventIndex = new ArrayList<>(events.size());
       try {
-        // Create bulk operation
-        List<WriteModel<Document>> bulkOperations = new ArrayList<>(events.size());
 
         // Add operations to bulk
-        for (MongoDbChangeEventContext event : events) {
+        for (int i = 0; i < events.size(); i++) {
+          MongoDbChangeEventContext event = events.get(i);
           Object docId = event.getDocumentId();
           Bson lookupById = eq("_id", docId);
 
           if (event.isDeleteEvent()) {
             // Add delete operation
             bulkOperations.add(new DeleteOneModel<>(lookupById));
+            bulkOpToEventIndex.add(i);
           } else {
             // Add upsert operation
-            bulkOperations.add(
-                new ReplaceOneModel<>(
-                    lookupById,
-                    Utils.jsonToDocument(event.getDataAsJsonString(), event.getDocumentId()),
-                    new ReplaceOptions().upsert(true)));
+            try {
+              Document doc = Utils.jsonToDocument(event.getModifiedJsonStringData(), event.getDocumentId());
+              if (doc != null) {
+                bulkOperations.add(
+                    new ReplaceOneModel<>(
+                        lookupById,
+                        doc,
+                        new ReplaceOptions().upsert(true)));
+                bulkOpToEventIndex.add(i);
+              }
+            } catch (Exception ex) {
+              FailsafeElement<MongoDbChangeEventContext, MongoDbChangeEventContext> failedElement =
+                  FailsafeElement.of(event, event);
+              failedElement.setErrorMessage(ex.getMessage());
+              failedElement.setStacktrace(Throwables.getStackTraceAsString(ex));
+              out.get(failedWriteTag).output(failedElement);
+            }
           }
         }
 
         // Execute bulk write with ordered(false) to isolate failed documents
-        BulkWriteResult result =
-            collection.bulkWrite(bulkOperations, new BulkWriteOptions().ordered(false));
-        LOG.debug(
-            "Bulk write completed for collection {}: {} inserts/updates, {} deletes",
-            collectionName,
-            result.getInsertedCount() + result.getModifiedCount() + result.getUpserts().size(),
-            result.getDeletedCount());
+        if (!bulkOperations.isEmpty()) {
+          BulkWriteResult result =
+              collection.bulkWrite(bulkOperations, new BulkWriteOptions().ordered(false));
+          LOG.debug(
+              "Bulk write completed for collection {}: {} inserts/updates, {} deletes",
+              collectionName,
+              result.getInsertedCount() + result.getModifiedCount() + result.getUpserts().size(),
+              result.getDeletedCount());
 
-        // Output successful events
-        for (MongoDbChangeEventContext event : events) {
-          out.get(successfulWriteTag).output(event);
+          // Output successful events if no exception occurred
+          for (int i = 0; i < bulkOperations.size(); i++) {
+            int eventIndex = bulkOpToEventIndex.get(i);
+            out.get(successfulWriteTag).output(events.get(eventIndex));
+          }
         }
       } catch (MongoBulkWriteException e) {
         LOG.warn(
             "Bulk write partially failed for collection {}: {}", collectionName, e.getMessage());
 
         // Identify failed documents and route them to appropriate tag
-        Set<Integer> failedIndices = new HashSet<>();
+        Set<Integer> failedBulkIndices = new HashSet<>();
         for (BulkWriteError error : e.getWriteErrors()) {
-          failedIndices.add(error.getIndex());
-          MongoDbChangeEventContext event = events.get(error.getIndex());
+          failedBulkIndices.add(error.getIndex());
+          int eventIndex = bulkOpToEventIndex.get(error.getIndex());
+          MongoDbChangeEventContext event = events.get(eventIndex);
           FailsafeElement<MongoDbChangeEventContext, MongoDbChangeEventContext> failedElement =
               FailsafeElement.of(event, event);
           failedElement.setErrorMessage(error.getMessage());
@@ -1290,9 +1402,10 @@ public class DataStreamMongoDBToFirestore {
         }
 
         // Output successful events that were not part of the failed indices
-        for (int i = 0; i < events.size(); i++) {
-          if (!failedIndices.contains(i)) {
-            out.get(successfulWriteTag).output(events.get(i));
+        for (int i = 0; i < bulkOperations.size(); i++) {
+          if (!failedBulkIndices.contains(i)) {
+            int eventIndex = bulkOpToEventIndex.get(i);
+            out.get(successfulWriteTag).output(events.get(eventIndex));
           }
         }
       } catch (Exception e) {
@@ -1324,50 +1437,69 @@ public class DataStreamMongoDBToFirestore {
         return;
       }
 
+      // Create bulk operation
+      List<WriteModel<Document>> bulkOperations = new ArrayList<>(events.size());
+      List<Integer> bulkOpToEventIndex = new ArrayList<>(events.size());
       try {
-        // Create bulk operation
-        List<WriteModel<Document>> bulkOperations = new ArrayList<>(events.size());
 
         // Add operations to bulk
-        for (MongoDbChangeEventContext event : events) {
+        for (int i = 0; i < events.size(); i++) {
+          MongoDbChangeEventContext event = events.get(i);
           Object docId = event.getDocumentId();
           Bson lookupById = eq("_id", docId);
 
           if (event.isDeleteEvent()) {
             // Add delete operation
             bulkOperations.add(new DeleteOneModel<>(lookupById));
+            bulkOpToEventIndex.add(i);
           } else {
             // Add upsert operation
-            bulkOperations.add(
-                new ReplaceOneModel<>(
-                    lookupById,
-                    Utils.jsonToDocument(event.getDataAsJsonString(), event.getDocumentId()),
-                    new ReplaceOptions().upsert(true)));
+            try {
+              Document doc = Utils.jsonToDocument(event.getModifiedJsonStringData(), event.getDocumentId());
+              if (doc != null) {
+                bulkOperations.add(
+                    new ReplaceOneModel<>(
+                        lookupById,
+                        doc,
+                        new ReplaceOptions().upsert(true)));
+                bulkOpToEventIndex.add(i);
+              }
+            } catch (Exception ex) {
+              FailsafeElement<MongoDbChangeEventContext, MongoDbChangeEventContext> failedElement =
+                  FailsafeElement.of(event, event);
+              failedElement.setErrorMessage(ex.getMessage());
+              failedElement.setStacktrace(Throwables.getStackTraceAsString(ex));
+              context.output(failedWriteTag, failedElement, Instant.now(), GlobalWindow.INSTANCE);
+            }
           }
         }
 
         // Execute bulk write with ordered(false) to isolate failed documents
-        BulkWriteResult result =
-            collection.bulkWrite(bulkOperations, new BulkWriteOptions().ordered(false));
-        LOG.debug(
-            "Bulk write completed for collection {}: {} inserts/updates, {} deletes",
-            collectionName,
-            result.getInsertedCount() + result.getModifiedCount() + result.getUpserts().size(),
-            result.getDeletedCount());
+        if (!bulkOperations.isEmpty()) {
+          BulkWriteResult result =
+              collection.bulkWrite(bulkOperations, new BulkWriteOptions().ordered(false));
+          LOG.debug(
+              "Bulk write completed for collection {}: {} inserts/updates, {} deletes",
+              collectionName,
+              result.getInsertedCount() + result.getModifiedCount() + result.getUpserts().size(),
+              result.getDeletedCount());
 
-        // Output successful events
-        for (MongoDbChangeEventContext event : events) {
-          context.output(successfulWriteTag, event, Instant.now(), GlobalWindow.INSTANCE);
+          // Output successful events if no exception occurred
+          for (int i = 0; i < bulkOperations.size(); i++) {
+            int eventIndex = bulkOpToEventIndex.get(i);
+            context.output(successfulWriteTag, events.get(eventIndex), Instant.now(), GlobalWindow.INSTANCE);
+          }
         }
       } catch (MongoBulkWriteException e) {
         LOG.warn(
             "Bulk write partially failed for collection {}: {}", collectionName, e.getMessage());
 
         // Identify failed documents and route them to appropriate tag
-        Set<Integer> failedIndices = new HashSet<>();
+        Set<Integer> failedBulkIndices = new HashSet<>();
         for (BulkWriteError error : e.getWriteErrors()) {
-          failedIndices.add(error.getIndex());
-          MongoDbChangeEventContext event = events.get(error.getIndex());
+          failedBulkIndices.add(error.getIndex());
+          int eventIndex = bulkOpToEventIndex.get(error.getIndex());
+          MongoDbChangeEventContext event = events.get(eventIndex);
           FailsafeElement<MongoDbChangeEventContext, MongoDbChangeEventContext> failedElement =
               FailsafeElement.of(event, event);
           failedElement.setErrorMessage(error.getMessage());
@@ -1384,9 +1516,10 @@ public class DataStreamMongoDBToFirestore {
         }
 
         // Output successful events that were not part of the failed indices
-        for (int i = 0; i < events.size(); i++) {
-          if (!failedIndices.contains(i)) {
-            context.output(successfulWriteTag, events.get(i), Instant.now(), GlobalWindow.INSTANCE);
+        for (int i = 0; i < bulkOperations.size(); i++) {
+          if (!failedBulkIndices.contains(i)) {
+            int eventIndex = bulkOpToEventIndex.get(i);
+            context.output(successfulWriteTag, events.get(eventIndex), Instant.now(), GlobalWindow.INSTANCE);
           }
         }
       } catch (Exception e) {

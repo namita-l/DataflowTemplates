@@ -108,11 +108,14 @@ public class ProcessChangeEventFn
                 new ReplaceOptions().upsert(true));
           } else {
             // Regular insert or update.
-            dataCollection.replaceOne(
-                session,
-                lookupById,
-                Utils.jsonToDocument(element.getDataAsJsonString(), element.getDocumentId()),
-                new ReplaceOptions().upsert(true));
+            Document doc = Utils.jsonToDocument(element.getModifiedJsonStringData(), element.getDocumentId());
+            if (doc != null) {
+              dataCollection.replaceOne(
+                  session,
+                  lookupById,
+                  doc,
+                  new ReplaceOptions().upsert(true));
+            }
             shadowCollection.replaceOne(
                 session,
                 lookupById,

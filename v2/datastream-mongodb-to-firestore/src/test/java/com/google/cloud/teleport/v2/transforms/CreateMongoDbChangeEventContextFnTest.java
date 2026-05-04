@@ -115,4 +115,31 @@ public class CreateMongoDbChangeEventContextFnTest {
 
     assertEquals(failureElement, failureCaptor.getValue());
   }
+
+  @Test
+  public void testProcessElementFailureMissingId() throws Exception {
+    String missingIdPayload =
+        """
+            {
+              "_metadata_source": {
+                "collection": "test_collection"
+              },
+              "data": {
+                "field1": "testString"
+              },
+              "_metadata_timestamp_seconds": 1683782270,
+              "_metadata_timestamp_nanos": 123456789
+            }""";
+    FailsafeElement<String, String> missingIdElement = FailsafeElement.of(missingIdPayload, missingIdPayload);
+    when(mockContext.element()).thenReturn(missingIdElement);
+
+    createFn.processElement(mockContext, mockReceiver);
+
+    ArgumentCaptor<FailsafeElement<String, String>> failureCaptor =
+        ArgumentCaptor.forClass(FailsafeElement.class);
+    verify(mockReceiver).get(CreateMongoDbChangeEventContextFn.failedCreationTag);
+    verify(mockFailureReceiver, times(1)).output(failureCaptor.capture());
+
+    assertEquals(missingIdElement, failureCaptor.getValue());
+  }
 }

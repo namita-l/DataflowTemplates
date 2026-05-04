@@ -59,6 +59,9 @@ public class MongoDbChangeEventContext implements Serializable {
   private final Document timestampDoc;
   private boolean isDlqReconsumed;
   private int retryCount;
+  // Stores the modified JSON string after UDF transformation.
+  // If present, this data should be used instead of the original jsonStringData.
+  private String modifiedJsonStringData;
 
   /** Gets the change type from the event metadata. */
   private String getChangeType(JsonNode changeEvent) {
@@ -223,6 +226,30 @@ public class MongoDbChangeEventContext implements Serializable {
 
   public String getDataAsJsonString() {
     return jsonStringData;
+  }
+
+  /**
+   * Returns the document data as a JSON string.
+   */
+  public String getDocumentDataAsJsonString() throws JsonProcessingException {
+    JsonNode eventNode = this.getChangeEvent();
+    JsonNode dataNode = eventNode.get("data");
+    return dataNode != null ? OBJECT_MAPPER.writeValueAsString(dataNode) : null;
+  }
+
+  /**
+   * Returns the modified JSON string data if it was updated by a UDF,
+   * otherwise falls back to the original jsonStringData.
+   */
+  public String getModifiedJsonStringData() {
+    return modifiedJsonStringData != null ? modifiedJsonStringData : jsonStringData;
+  }
+
+  /**
+   * Sets the modified JSON string data after UDF transformation.
+   */
+  public void setModifiedJsonStringData(String modifiedJsonStringData) {
+    this.modifiedJsonStringData = modifiedJsonStringData;
   }
 
   public Document getTimestampDoc() {

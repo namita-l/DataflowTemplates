@@ -141,6 +141,23 @@ public class UtilsTest {
                 "{\"_id\": 1, \"arrayField\": [\"hello\", 10], \"dateField\": {\"$date\": \"2019-08-11T17:54:14.692Z\"}, \"dateBefore1970\": {\"$date\": {\"$numberLong\": \"-1577923200000\"}}, \"decimal128Field\": {\"$numberDecimal\": \"10.99\"}, \"documentField\": {\"a\": \"hello\"}, \"doubleField\": 10.5, \"infiniteNumber\": {\"$numberDouble\": \"Infinity\"}, \"int32field\": 10, \"int64Field\": 50, \"minKeyField\": {\"$minKey\": 1}, \"maxKeyField\": {\"$maxKey\": 1}, \"regexField\": {\"$regularExpression\": {\"pattern\": \"^H\", \"options\": \"i\"}}, \"timestampField\": {\"$timestamp\": {\"t\": 1565545664, \"i\": 1}}, \"uuid\": {\"$binary\": {\"base64\": \"OyQRAeK7QlWMr0E2xWapYg==\", \"subType\": \"04\"}}}"));
   }
 
+  // Verifies that jsonToDocument returns null for CDC update events
+  // with null data, preventing NPEs.
+  @Test
+  public void testJsonToDocument_nullData_cdcUpdate() {
+    String jsonString = "{\"_metadata_read_method\":\"cdc\",\"_metadata_source_type\":\"cdc\",\"change_type\":\"UPDATE\"}";
+    Document result = Utils.jsonToDocument(jsonString, 1L);
+    assertEquals(null, result);
+  }
+
+  // Verifies that jsonToDocument still throws an exception for non-update events
+  // with null data, preserving existing behavior for other event types.
+  @Test(expected = IllegalArgumentException.class)
+  public void testJsonToDocument_nullData_nonCdcUpdate() {
+    String jsonString = "{\"_metadata_read_method\":\"backfill\",\"_metadata_source_type\":\"backfill\",\"change_type\":\"READ\"}";
+    Utils.jsonToDocument(jsonString, 1L);
+  }
+
   @Test
   public void testDocumentIdToString() {
     assertEquals("test_id", Utils.documentIdToString("test_id"));
@@ -157,5 +174,10 @@ public class UtilsTest {
 
     Document doc = new Document("a", 1).append("b", "test");
     assertEquals("{\"a\": 1, \"b\": \"test\"}", Utils.documentIdToString(doc));
+  }
+
+  @Test(expected = org.bson.json.JsonParseException.class)
+  public void testJsonToDocument_invalidJsonThrows() {
+    Utils.jsonToDocument("invalid json", 1L);
   }
 }

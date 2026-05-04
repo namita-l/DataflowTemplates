@@ -43,14 +43,35 @@ public final class Utils {
   }
 
   public static Document jsonToDocument(String jsonString, Object documentId) {
-    Document rawDoc;
-    try {
-      rawDoc = Document.parse(Document.parse(jsonString).get(DATA_COL).toString());
-    } catch (Exception ex) {
-      LOG.info(
-          "Document parsing for {} failed due to {}, try casting.", jsonString, ex.getMessage());
-      rawDoc = (Document) Document.parse(jsonString).get(DATA_COL);
+    Document parsedJson = Document.parse(jsonString);
+    Object dataObj = parsedJson.get(DATA_COL);
+
+    // CDC update events might not contain the "data" field if the document was
+    // modified and then deleted.
+    // In that case we return null to indicate that this event should be ignored or handled as a no-op document update,
+    // preventing NullPointerException later when trying to access document fields.
+    // We only check change_type="UPDATE" because any non-READ event is considered CDC in this template.
+    if (dataObj == null) {
+      String changeType = parsedJson.getString("change_type");
+
+      if ("UPDATE".equals(changeType)) {
+        return null;
+      } else {
+        throw new IllegalArgumentException("Document parsing failed: data field is null");
+      }
     }
+
+    Document rawDoc;
+    if (dataObj instanceof Document) {
+      rawDoc = (Document) dataObj;
+    } else {
+      try {
+        rawDoc = Document.parse(dataObj.toString());
+      } catch (Exception ex) {
+        throw new IllegalArgumentException("Failed to parse data field to Document", ex);
+      }
+    }
+
     rawDoc.put(MongoDbChangeEventContext.DOC_ID_COL, documentId);
     return rawDoc;
   }

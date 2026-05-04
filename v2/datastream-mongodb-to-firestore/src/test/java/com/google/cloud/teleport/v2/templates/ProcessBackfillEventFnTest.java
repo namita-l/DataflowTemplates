@@ -91,8 +91,10 @@ public class ProcessBackfillEventFnTest {
     when(event2.getDataCollection()).thenReturn(COLLECTION_NAME);
     when(event1.getDocumentId()).thenReturn("id1");
     when(event2.getDocumentId()).thenReturn("id2");
-    when(event1.getDataAsJsonString()).thenReturn("{\"data\": {\"_id\":\"id1\"}}");
-    when(event2.getDataAsJsonString()).thenReturn("{\"data\": {\"_id\":\"id2\"}}");
+    // Updated to use getModifiedJsonStringData to verify that
+    // the test covers the path that uses modified data if present (e.g. after UDF).
+    when(event1.getModifiedJsonStringData()).thenReturn("{\"data\": {\"_id\":\"id1\"}}");
+    when(event2.getModifiedJsonStringData()).thenReturn("{\"data\": {\"_id\":\"id2\"}}");
 
     when(mockContext.element()).thenReturn(event1).thenReturn(event2);
 
@@ -139,8 +141,8 @@ public class ProcessBackfillEventFnTest {
     when(event2.getDataCollection()).thenReturn(COLLECTION_NAME);
     when(event1.getDocumentId()).thenReturn("id1");
     when(event2.getDocumentId()).thenReturn("id2");
-    when(event1.getDataAsJsonString()).thenReturn("{\"data\": {\"_id\":\"id1\"}}");
-    when(event2.getDataAsJsonString()).thenReturn("{\"data\": {\"_id\":\"id2\"}}");
+    when(event1.getModifiedJsonStringData()).thenReturn("{\"data\": {\"_id\":\"id1\"}}");
+    when(event2.getModifiedJsonStringData()).thenReturn("{\"data\": {\"_id\":\"id2\"}}");
 
     when(mockContext.element()).thenReturn(event1).thenReturn(event2);
 
@@ -171,5 +173,44 @@ public class ProcessBackfillEventFnTest {
     FailsafeElement failedElement = failureCaptor.getValue();
     assertEquals(event2, failedElement.getOriginalPayload());
     assertEquals("Some other error", failedElement.getErrorMessage());
+  }
+
+  // Verifies that when an event results in a null document (e.g., CDC update with null data),
+  // it is correctly ignored and not added to the batch for processing.
+  @Test
+  public void testProcessBatch_nullDocumentIgnored() {
+    MongoDbChangeEventContext event1 = mock(MongoDbChangeEventContext.class);
+    MongoDbChangeEventContext event2 = mock(MongoDbChangeEventContext.class);
+
+    when(event1.getDataCollection()).thenReturn(COLLECTION_NAME);
+    when(event2.getDataCollection()).thenReturn(COLLECTION_NAME);
+    when(event1.getDocumentId()).thenReturn("id1");
+    when(event2.getDocumentId()).thenReturn("id2");
+    // event1 is normal
+    when(event1.getModifiedJsonStringData()).thenReturn("{\"data\": {\"_id\":\"id1\"}}");
+    // event2 results in null doc (CDC update with no data)
+    when(event2.getModifiedJsonStringData()).thenReturn("{\"_metadata_read_method\":\"cdc\",\"_metadata_source_type\":\"cdc\",\"change_type\":\"UPDATE\"}");
+
+    when(mockContext.element()).thenReturn(event1).thenReturn(event2);
+
+    // Mock successful write for event1
+    com.mongodb.bulk.BulkWriteResult mockResult = mock(com.mongodb.bulk.BulkWriteResult.class);
+    when(mockCollection.bulkWrite(anyList(), any())).thenReturn(mockResult);
+    when(mockResult.getInsertedCount()).thenReturn(1);
+    when(mockResult.getModifiedCount()).thenReturn(0);
+    when(mockResult.getUpserts()).thenReturn(Collections.emptyList());
+    when(mockResult.getDeletedCount()).thenReturn(0);
+
+    // Process first element
+    fn.processElement(mockContext, mockReceiver);
+
+    // Process second element, should trigger batch processing
+    fn.processElement(mockContext, mockReceiver);
+
+    // Verify output: only event1 should be output as success
+    verify(mockSuccessReceiver, times(1)).output(event1);
+    verify(mockSuccessReceiver, times(0)).output(event2);
+    verify(mockFailureReceiver, times(0)).output(any());
+    verify(mockSevereFailureReceiver, times(0)).output(any());
   }
 }

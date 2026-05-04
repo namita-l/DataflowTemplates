@@ -46,6 +46,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import org.mockito.ArgumentCaptor;
+import org.mockito.ArgumentMatchers;
 
 /** Unit tests for {@link ProcessChangeEventFn}. */
 @RunWith(JUnit4.class)
@@ -121,6 +122,7 @@ public class ProcessChangeEventFnTest {
     when(mockElement.getDocumentId()).thenReturn(DOC_ID);
     when(mockElement.getTimestampDoc()).thenReturn(mockTimestampDocNewer);
     when(mockElement.getDataAsJsonString()).thenReturn(mockDataDoc.toJson());
+    when(mockElement.getModifiedJsonStringData()).thenReturn(mockDataDoc.toJson());
     when(mockElement.getShadowDocument()).thenReturn(mockShadowDocElement);
     when(mockShadowCollection.find(mockSession, LOOKUP_BY_DOC_ID)).thenReturn(mockFindIterable);
 
@@ -259,6 +261,26 @@ public class ProcessChangeEventFnTest {
   }
 
   @Test
+  public void testProcessElement_nullDocumentIgnored() {
+    when(mockElement.isDeleteEvent()).thenReturn(false);
+    when(mockElement.getTimestampDoc()).thenReturn(mockTimestampDocNewer);
+    when(mockFindIterable.first()).thenReturn(mockShadowDocOlder);
+    
+    // Simulate UDF output resulting in null document (e.g. CDC update with null data)
+    when(mockElement.getModifiedJsonStringData()).thenReturn("{\"change_type\":\"UPDATE\"}");
+    
+    processFn.processElement(mockContext, mockReceiver);
+    
+    verify(mockShadowCollection).find(mockSession, LOOKUP_BY_DOC_ID);
+    // Verify that replaceOne was NEVER called on data collection
+    verify(mockDataCollection, never()).replaceOne(any(), any(), any(), any());
+    // But shadow collection should still be updated!
+    verify(mockShadowCollection).replaceOne(ArgumentMatchers.eq(mockSession), ArgumentMatchers.eq(LOOKUP_BY_DOC_ID), ArgumentMatchers.eq(mockShadowDocElement), any(ReplaceOptions.class));
+    verify(mockSession).commitTransaction();
+    verify(mockReceiver).get(ProcessChangeEventFn.successfulWriteTag);
+  }
+
+  @Test
   public void testProcessElementTransientError_mixedErrors() {
     MongoException transientError = new MongoException("Fake transient error.");
     transientError.addLabel("TransientTransactionError");
@@ -307,6 +329,37 @@ public class ProcessChangeEventFnTest {
     verify(mockShadowCollection, times(1)).find(mockSession, LOOKUP_BY_DOC_ID);
     verify(mockReceiver).get(ProcessChangeEventFn.severeFailedWriteTag);
     verify(mockSevereFailureReceiver, times(1)).output(any());
+    verify(mockSession, never()).commitTransaction();
+  }
+
+  @Test
+  public void testProcessElement_udfOutputWithoutDataFieldSucceeds() {
+    // Mock the modified data to have the "data" field, simulating the fix in Option 1
+    when(mockElement.getModifiedJsonStringData()).thenReturn("{\"data\":{\"field\":\"value\"}}");
+    when(mockFindIterable.first()).thenReturn(null);
+    
+    UpdateResult mockUpdateResult = mock(UpdateResult.class);
+    when(mockDataCollection.replaceOne(any(), any(), any(), any())).thenReturn(mockUpdateResult);
+    when(mockShadowCollection.replaceOne(any(), any(), any(), any())).thenReturn(mockUpdateResult);
+
+    processFn.processElement(mockContext, mockReceiver);
+
+    verify(mockSession).commitTransaction();
+    verify(mockReceiver).get(ProcessChangeEventFn.successfulWriteTag);
+  }
+
+  @Test
+  public void testProcessElement_udfOutputWithoutDataFieldGoesToDlq() {
+    // Simulate output from line 630 fallback (raw document data)
+    when(mockElement.getModifiedJsonStringData()).thenReturn("{\"field\":\"value\"}");
+    when(mockFindIterable.first()).thenReturn(null);
+
+    processFn.processElement(mockContext, mockReceiver);
+
+    // Verify that it goes to severe DLQ
+    verify(mockReceiver).get(ProcessChangeEventFn.severeFailedWriteTag);
+    verify(mockSevereFailureReceiver, times(1)).output(any());
+    // Verify transaction was aborted or at least not committed
     verify(mockSession, never()).commitTransaction();
   }
 }
