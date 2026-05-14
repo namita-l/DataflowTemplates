@@ -50,6 +50,7 @@ public class MongoDbChangeEventContext implements Serializable {
   public static final String OID_FIELD_NAME = "$oid";
 
   private final JsonNode changeEvent;
+  private final JsonNode originalChangeEvent;
   private final String dataCollection;
   private final String shadowCollection;
   private final Object documentId;
@@ -87,7 +88,19 @@ public class MongoDbChangeEventContext implements Serializable {
 
   public MongoDbChangeEventContext(JsonNode payload, String shadowCollectionPrefix)
       throws JsonProcessingException {
+    this(payload, payload, shadowCollectionPrefix);
+  }
+
+  public MongoDbChangeEventContext(JsonNode payload, JsonNode originalPayload, String shadowCollectionPrefix)
+      throws JsonProcessingException {
+    // Extracts the actual change event. If wrapped in a DLQ structure like {"changeEvent": {...}},
+    // it extracts the inner object.
+    // Example input: { "changeEvent": { "data": "{...}" }, "dataCollection": "test" }
+    // Result: { "data": "{...}" }
     this.changeEvent = Utils.extractInnerEvent(payload);
+    // Example originalPayload (from DLQ): { "changeEvent": { "data": "{\"name\": \"John\"}" }, "dataCollection": "test" }
+    // Resulting originalChangeEvent: { "data": "{\"name\": \"John\"}" }
+    this.originalChangeEvent = Utils.extractInnerEvent(originalPayload);
 
     this.retryCount =
         changeEvent.has(DatastreamConstants.RETRY_COUNT)
@@ -196,6 +209,10 @@ public class MongoDbChangeEventContext implements Serializable {
 
   public JsonNode getChangeEvent() {
     return changeEvent;
+  }
+
+  public JsonNode getOriginalChangeEvent() {
+    return originalChangeEvent;
   }
 
   public String getDataCollection() {

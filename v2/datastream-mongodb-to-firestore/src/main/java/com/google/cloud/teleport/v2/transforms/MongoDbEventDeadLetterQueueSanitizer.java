@@ -26,14 +26,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * The MongoDbEventDeadLetterQueueSanitizer cleans and prepares failed MongoDbEvent to BsonDocument
+ * The MongoDbEventDeadLetterQueueSanitizer cleans and prepares failed
+ * MongoDbEvent to BsonDocument
  * conversion to be stored in a GCS Dead Letter Queue.
  */
 public class MongoDbEventDeadLetterQueueSanitizer
-    extends DeadLetterQueueSanitizer<
-        FailsafeElement<MongoDbChangeEventContext, MongoDbChangeEventContext>, String> {
-  private static final Logger LOG =
-      LoggerFactory.getLogger(MongoDbEventDeadLetterQueueSanitizer.class);
+    extends DeadLetterQueueSanitizer<FailsafeElement<MongoDbChangeEventContext, MongoDbChangeEventContext>, String> {
+  private static final Logger LOG = LoggerFactory.getLogger(MongoDbEventDeadLetterQueueSanitizer.class);
   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
   @Override
@@ -44,8 +43,14 @@ public class MongoDbEventDeadLetterQueueSanitizer
       // Serialize the change event to JSON
       ObjectNode jsonNode = OBJECT_MAPPER.createObjectNode();
 
-      // Add the original change event JSON
-      jsonNode.set("changeEvent", changeEvent.getChangeEvent());
+      // Add the original change event JSON. This preserves the raw source data in the
+      // DLQ,
+      // ensuring that retry attempts can re-apply updated UDF logic to the original
+      // payload.
+      //
+      // Example jsonNode after set: { "changeEvent": { "_metadata_change_type":
+      // "INSERT", "data": "{\"name\": \"John\"}" } }
+      jsonNode.set("changeEvent", changeEvent.getOriginalChangeEvent());
 
       // Add other important fields
       jsonNode.put("dataCollection", changeEvent.getDataCollection());

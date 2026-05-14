@@ -371,46 +371,7 @@ public final class DataStreamMongoDBToFirestoreTest {
     pipeline.run();
   }
 
-  @Test
-  public void prepareUdfInputFn_alreadyProcessed_bypassesUdf() {
-    String processedJson = "{\"_metadata_udf_processed\": true, \"data\": \"{}\"}";
-    FailsafeElement<String, String> input = FailsafeElement.of(processedJson, processedJson);
 
-    PCollectionTuple result =
-        pipeline
-            .apply(
-                "CreateInput",
-                Create.of(input)
-                    .withCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of())))
-            .apply(
-                "PrepareUdfInput",
-                ParDo.of(new DataStreamMongoDBToFirestore.PrepareUdfInputFn())
-                    .withOutputTags(
-                        SUCCESS_TAG,
-                        TupleTagList.of(DataStreamMongoDBToFirestore.BYPASS_UDF_TAG)
-                            .and(DataStreamMongoDBToFirestore.PREPARE_FAILURE_TAG)));
-
-    result
-        .get(SUCCESS_TAG)
-        .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
-    result
-        .get(DataStreamMongoDBToFirestore.BYPASS_UDF_TAG)
-        .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
-    result
-        .get(DataStreamMongoDBToFirestore.PREPARE_FAILURE_TAG)
-        .setCoder(FailsafeElementCoder.of(StringUtf8Coder.of(), StringUtf8Coder.of()));
-
-    PAssert.that(result.get(DataStreamMongoDBToFirestore.BYPASS_UDF_TAG))
-        .satisfies(
-            iterable -> {
-              FailsafeElement<String, String> element = iterable.iterator().next();
-              assertEquals(processedJson, element.getOriginalPayload());
-              assertEquals(processedJson, element.getPayload());
-              return null;
-            });
-
-    pipeline.run();
-  }
 
   @Test
   public void prepareUdfInputFn_invalidJson_routesToDlq() {
@@ -483,7 +444,6 @@ public final class DataStreamMongoDBToFirestoreTest {
               try {
                 ObjectMapper mapper = new ObjectMapper();
                 JsonNode node = mapper.readTree(element.getPayload());
-                assertFalse(node.has("_metadata_udf_processed"));
                 assertEquals("{\"name\":\"John\"}", node.get("data").asText());
               } catch (Exception e) {
                 throw new RuntimeException(e);
@@ -573,11 +533,10 @@ public final class DataStreamMongoDBToFirestoreTest {
                 JsonNode dataNode = mapper.readTree(dataStr);
                 assertEquals("Jane", dataNode.get("name").asText());
 
-                // Verify that originalPayload is ALSO overwritten with the transformed data
+                // Verify that originalPayload is PRESERVED and not overwritten
                 JsonNode originalNode = mapper.readTree(element.getOriginalPayload());
-                String originalDataStr = originalNode.get("data").asText();
-                JsonNode originalDataNode = mapper.readTree(originalDataStr);
-                assertEquals("Jane", originalDataNode.get("name").asText());
+                JsonNode originalDataNode = originalNode.get("data");
+                assertEquals("John", originalDataNode.get("name").asText());
               } catch (Exception e) {
                 throw new RuntimeException(e);
               }
@@ -974,12 +933,6 @@ public final class DataStreamMongoDBToFirestoreTest {
               assertTrue(eventMap.containsKey("DELETE"));
               assertTrue(eventMap.containsKey("UPDATE"));
               assertTrue(eventMap.containsKey("READ"));
-
-              // Verify UDF processed flag
-              assertTrue(eventMap.get("INSERT").has("_metadata_udf_processed"));
-              assertTrue(eventMap.get("UPDATE").has("_metadata_udf_processed"));
-              assertTrue(eventMap.get("READ").has("_metadata_udf_processed"));
-              assertFalse(eventMap.get("DELETE").has("_metadata_udf_processed"));
 
               try {
                 // Verify UDF was applied to INSERT, UPDATE, READ

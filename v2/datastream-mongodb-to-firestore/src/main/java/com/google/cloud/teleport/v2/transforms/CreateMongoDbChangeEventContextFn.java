@@ -52,9 +52,13 @@ public class CreateMongoDbChangeEventContextFn
   public void processElement(ProcessContext context, MultiOutputReceiver out) {
     FailsafeElement<String, String> element = context.element();
     try {
-      JsonNode jsonNode = OBJECT_MAPPER.readTree(element.getOriginalPayload());
+      // Example payload (regular): { "_metadata_change_type": "INSERT", "data": "{\"name\": \"John\"}" }
+      // Example payload (from DLQ): { "changeEvent": { "data": "{...}" }, "dataCollection": "test" }
+      JsonNode jsonNode = OBJECT_MAPPER.readTree(element.getPayload());
+      // Example originalPayload (typically same as payload at this stage): { "_metadata_change_type": "INSERT", "data": "{\"name\": \"John\"}" }
+      JsonNode originalNode = OBJECT_MAPPER.readTree(element.getOriginalPayload());
       MongoDbChangeEventContext changeEventContext =
-          new MongoDbChangeEventContext(jsonNode, shadowCollectionPrefix);
+          new MongoDbChangeEventContext(jsonNode, originalNode, shadowCollectionPrefix);
       out.get(successfulCreationTag).output(changeEventContext);
     } catch (Exception e) {
       LOG.error("Error creating MongoDbChangeEventContext, exception: {}, element: {}", e, element);

@@ -29,6 +29,7 @@ import static org.junit.Assert.assertTrue;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.cloud.teleport.v2.transforms.Utils;
 import com.google.common.collect.ImmutableMap;
 import org.bson.Document;
@@ -571,5 +572,24 @@ public class MongoDbChangeEventContextTest {
             + "\"isDlqReconsumed\":false,\"_metadata_retry_count\":0}";
 
     assertEquals(jsonString, expectedJson);
+  }
+
+  @Test
+  public void testConstructorWithOriginalEvent() throws JsonProcessingException {
+    JsonNode originalEvent = insertEvent.deepCopy();
+    ((ObjectNode) insertEvent).put("modified", true);
+    
+    MongoDbChangeEventContext context = new MongoDbChangeEventContext(insertEvent, originalEvent, SHADOW_PREFIX);
+    
+    assertEquals(insertEvent, context.getChangeEvent());
+    assertEquals(originalEvent, context.getOriginalChangeEvent());
+  }
+
+  @Test
+  public void test2ArgumentConstructorSetsOriginalSameAsCurrent() throws JsonProcessingException {
+    MongoDbChangeEventContext context = new MongoDbChangeEventContext(insertEvent, SHADOW_PREFIX);
+    
+    assertEquals(insertEvent, context.getChangeEvent());
+    assertEquals(insertEvent, context.getOriginalChangeEvent());
   }
 }
